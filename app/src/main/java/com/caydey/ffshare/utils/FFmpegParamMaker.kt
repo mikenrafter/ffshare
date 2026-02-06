@@ -7,7 +7,18 @@ import java.util.StringJoiner
 import kotlin.math.ceil
 
 class FFmpegParamMaker(val settings: Settings, val utils: Utils) {
+    // Returns true if two-pass encoding should be used
+    fun shouldUseTwoPass(mediaType: Utils.MediaType, outputMediaType: Utils.MediaType): Boolean {
+        return utils.isVideo(outputMediaType) && 
+               settings.videoMaxFileSize != 0 && 
+               outputMediaType != Utils.MediaType.WEBM // webm doesn't support two-pass with these settings
+    }
+
     fun create(inputFile: Uri, mediaInformation: MediaInformation, mediaType: Utils.MediaType, outputMediaType: Utils.MediaType): String {
+        return createPass(inputFile, mediaInformation, mediaType, outputMediaType, passNumber = 0)
+    }
+
+    fun createPass(inputFile: Uri, mediaInformation: MediaInformation, mediaType: Utils.MediaType, outputMediaType: Utils.MediaType, passNumber: Int): String {
         // custom params
         if (utils.isImage(outputMediaType) && settings.customImageParams.isNotEmpty()) return settings.customImageParams
         if (utils.isVideo(outputMediaType) && settings.customVideoParams.isNotEmpty()) return settings.customVideoParams
@@ -55,9 +66,6 @@ class FFmpegParamMaker(val settings: Settings, val utils: Utils) {
 
         // video
         if (utils.isVideo(outputMediaType)) { // check outputMediaType not mediaType because conversions
-            // crf
-            params.add("-crf ${settings.videoCrf}")
-
             // pixel format
             videoFormatParams.add("format=yuv420p")
 
@@ -75,17 +83,17 @@ class FFmpegParamMaker(val settings: Settings, val utils: Utils) {
                 }
             }
 
-            //  max file size (limit the bitrate to achieve this)
+            //  max file size (use two-pass encoding with target bitrate)
             if (settings.videoMaxFileSize != 0) {
-                // ffmpeg does not like -maxrate & -bufsize params when the output file is webm
+                // ffmpeg does not like two-pass params when the output file is webm
                 if (outputMediaType != Utils.MediaType.WEBM) {
-                    // Calculate maximum bitrate in kbps.
-                    // Ceil duration to ensure the maximum is strict. toInt to floor result, ffmpeg takes ints.
-                    val maxBitrate = (settings.videoMaxFileSize * 8 / ceil(mediaInformation.duration.toFloat())).toInt()
-                    Timber.d("Maximum bitrate for targeted filesize (%dK): %dk", settings.videoMaxFileSize, maxBitrate)
+                    // Calculate target bitrate in kbps.
+                    // Using formula: bitrate = target size / duration
+                    val targetBitrate = (settings.videoMaxFileSize * 8 / mediaInformation.duration.toFloat()).toInt()
+                    Timber.d("Target bitrate for filesize (%dK): %dk", settings.videoMaxFileSize, targetBitrate)
 
                     // audio can have at most one third of the total bitrate
-                    val audioSplit = maxBitrate / 3
+                    val audioSplit = targetBitrate / 3
                     // round audio bitrate down to 192,128,96,64,32,24
                     val audioBitrate = if (audioSplit > 192) 192 // maximum audio bitrate is 192k
                     else if (audioSplit > 128) 128
@@ -97,10 +105,21 @@ class FFmpegParamMaker(val settings: Settings, val utils: Utils) {
                     // set audio bitrate
                     params.add("-b:a ${audioBitrate}k")
 
-                    // set max video bitrate
-                    val videoBitrate = (maxBitrate - audioBitrate)
-                    params.add("-maxrate ${videoBitrate}k -bufsize ${videoBitrate}k")
+                    // set target video bitrate for two-pass encoding
+                    val videoBitrate = (targetBitrate - audioBitrate)
+                    params.add("-b:v ${videoBitrate}k")
+                    
+                    // Add pass-specific parameters for two-pass encoding
+                    if (passNumber > 0) {
+                        params.add("-pass $passNumber")
+                    }
+                } else {
+                    // For webm, use CRF mode as fallback
+                    params.add("-crf ${settings.videoCrf}")
                 }
+            } else {
+                // No target file size, use CRF (quality-based encoding)
+                params.add("-crf ${settings.videoCrf}")
             }
         }
 

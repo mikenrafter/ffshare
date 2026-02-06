@@ -107,6 +107,49 @@ class MediaCompressor(private val context: Context) {
             duration = (mediaInformation.duration.toFloat() * 1_000).toInt()
         }
 
+        // Check if two-pass encoding is needed
+        val useTwoPass = ffmpegParamMaker.shouldUseTwoPass(mediaType, outputMediaType)
+        
+        if (useTwoPass) {
+            Timber.d("Using two-pass encoding for target file size")
+            executeTwoPassEncoding(
+                activity, inputFileUri, mediaInformation, mediaType, outputMediaType,
+                inputFileName, outputFile, outputFileUri, inputFileSize, duration,
+                showProgress, successHandler, failureHandler
+            )
+        } else {
+            executeSinglePassEncoding(
+                activity, inputFileUri, mediaInformation, mediaType, outputMediaType,
+                inputFileName, outputFile, outputFileUri, inputFileSize, duration,
+                showProgress, successHandler, failureHandler
+            )
+        }
+    }
+
+    private fun executeSinglePassEncoding(
+        activity: Activity,
+        inputFileUri: Uri,
+        mediaInformation: MediaInformation,
+        mediaType: Utils.MediaType,
+        outputMediaType: Utils.MediaType,
+        inputFileName: String,
+        outputFile: java.io.File,
+        outputFileUri: Uri,
+        inputFileSize: Long,
+        duration: Int,
+        showProgress: Boolean,
+        successHandler: (uri: Uri, inputFileSize: Long, outputFileSize: Long) -> Unit,
+        failureHandler: () -> Unit
+    ) {
+        val txtFfmpegCommand: TextView = activity.findViewById(R.id.txtFfmpegCommand)
+        val txtInputFile: TextView = activity.findViewById(R.id.txtInputFile)
+        val txtInputFileSize: TextView = activity.findViewById(R.id.txtInputFileSize)
+        val txtOutputFile: TextView = activity.findViewById(R.id.txtOutputFile)
+        val txtOutputFileSize: TextView = activity.findViewById(R.id.txtOutputFileSize)
+        val txtProcessedTime: TextView = activity.findViewById(R.id.txtProcessedTime)
+        val txtProcessedTimeTotal: TextView = activity.findViewById(R.id.txtProcessedTimeTotal)
+        val txtProcessedPercent: TextView = activity.findViewById(R.id.txtProcessedPercent)
+
         val params = ffmpegParamMaker.create(inputFileUri, mediaInformation, mediaType, outputMediaType)
         val inputSaf: String = FFmpegKitConfig.getSafParameterForRead(context, inputFileUri)
         val outputSaf: String = FFmpegKitConfig.getSafParameterForWrite(context, outputFileUri)
@@ -186,6 +229,171 @@ class MediaCompressor(private val context: Context) {
                 txtOutputFileSize.text = utils.bytesToHuman(statistics.size)
             }
         })
+    }
+
+    private fun executeTwoPassEncoding(
+        activity: Activity,
+        inputFileUri: Uri,
+        mediaInformation: MediaInformation,
+        mediaType: Utils.MediaType,
+        outputMediaType: Utils.MediaType,
+        inputFileName: String,
+        outputFile: java.io.File,
+        outputFileUri: Uri,
+        inputFileSize: Long,
+        duration: Int,
+        showProgress: Boolean,
+        successHandler: (uri: Uri, inputFileSize: Long, outputFileSize: Long) -> Unit,
+        failureHandler: () -> Unit
+    ) {
+        val txtFfmpegCommand: TextView = activity.findViewById(R.id.txtFfmpegCommand)
+        val txtInputFile: TextView = activity.findViewById(R.id.txtInputFile)
+        val txtInputFileSize: TextView = activity.findViewById(R.id.txtInputFileSize)
+        val txtOutputFile: TextView = activity.findViewById(R.id.txtOutputFile)
+        val txtOutputFileSize: TextView = activity.findViewById(R.id.txtOutputFileSize)
+        val txtProcessedTime: TextView = activity.findViewById(R.id.txtProcessedTime)
+        val txtProcessedTimeTotal: TextView = activity.findViewById(R.id.txtProcessedTimeTotal)
+        val txtProcessedPercent: TextView = activity.findViewById(R.id.txtProcessedPercent)
+
+        val inputSaf: String = FFmpegKitConfig.getSafParameterForRead(context, inputFileUri)
+        val outputSaf: String = FFmpegKitConfig.getSafParameterForWrite(context, outputFileUri)
+
+        // Pass 1: Analysis pass
+        val paramsPass1 = ffmpegParamMaker.createPass(inputFileUri, mediaInformation, mediaType, outputMediaType, passNumber = 1)
+        val commandPass1 = "-y -i $inputSaf $paramsPass1 -f ${getOutputFormat(outputMediaType)} /dev/null"
+        val prettyCommandPass1 = "ffmpeg -y -i $inputFileName $paramsPass1 -f ${getOutputFormat(outputMediaType)} /dev/null"
+
+        // Pass 2: Encoding pass
+        val paramsPass2 = ffmpegParamMaker.createPass(inputFileUri, mediaInformation, mediaType, outputMediaType, passNumber = 2)
+        val commandPass2 = "-y -i $inputSaf $paramsPass2 $outputSaf"
+        val prettyCommandPass2 = "ffmpeg -y -i $inputFileName $paramsPass2 ${outputFile.name}"
+
+        val prettyCommandBoth = "Pass 1: $prettyCommandPass1\nPass 2: $prettyCommandPass2"
+
+        // set TextViews
+        Handler(Looper.getMainLooper()).post {
+            txtFfmpegCommand.text = prettyCommandBoth
+            txtInputFile.text = inputFileName
+            txtInputFileSize.text = utils.bytesToHuman(inputFileSize)
+            txtOutputFile.text = outputFile.name
+            txtOutputFileSize.text = utils.bytesToHuman(0)
+            txtProcessedTime.text = utils.millisToMicrowaveTime(0)
+            txtProcessedTimeTotal.text = utils.millisToMicrowaveTime(duration)
+            txtProcessedPercent.text = context.getString(R.string.format_percentage, 0.0f)
+        }
+
+        Timber.d("Executing two-pass encoding")
+        Timber.d("Pass 1: 'ffmpeg %s'", commandPass1)
+
+        // Execute Pass 1
+        FFmpegKit.executeAsync(commandPass1, { sessionPass1 ->
+            // Pass 1 completed
+            if (!sessionPass1.returnCode.isValueSuccess) { // failed
+                if (!sessionPass1.returnCode.isValueCancel) { // failure was not caused by a cancel
+                    Timber.d("ffmpeg pass 1 failed")
+                    Handler(Looper.getMainLooper()).post {
+                        Toast.makeText(context, context.getString(R.string.ffmpeg_error), Toast.LENGTH_LONG).show()
+                    }
+                    logsDbHelper.addLog(Log(
+                        prettyCommandBoth,
+                        inputFileName,
+                        outputFile.name,
+                        false,
+                        "Pass 1 failed:\n${sessionPass1.output}",
+                        inputFileSize,
+                        -1
+                    ))
+                    failureHandler()
+                }
+            } else { // Pass 1 success, start Pass 2
+                Timber.d("Pass 1 completed successfully, starting Pass 2")
+                Timber.d("Pass 2: 'ffmpeg %s'", commandPass2)
+                
+                // Update UI to show we're in pass 2
+                Handler(Looper.getMainLooper()).post {
+                    txtProcessedPercent.text = context.getString(R.string.format_percentage, 50.0f)
+                }
+
+                // Execute Pass 2
+                FFmpegKit.executeAsync(commandPass2, { sessionPass2 ->
+                    // Pass 2 completed
+                    if (!sessionPass2.returnCode.isValueSuccess) { // failed
+                        if (!sessionPass2.returnCode.isValueCancel) { // failure was not caused by a cancel
+                            Timber.d("ffmpeg pass 2 failed")
+                            Handler(Looper.getMainLooper()).post {
+                                Toast.makeText(context, context.getString(R.string.ffmpeg_error), Toast.LENGTH_LONG).show()
+                            }
+                            logsDbHelper.addLog(Log(
+                                prettyCommandBoth,
+                                inputFileName,
+                                outputFile.name,
+                                false,
+                                "Pass 2 failed:\n${sessionPass2.output}",
+                                inputFileSize,
+                                -1
+                            ))
+                            failureHandler()
+                        }
+                    } else { // Pass 2 success
+                        Timber.d("ffmpeg two-pass encoding completed successfully")
+                        if (settings.copyExifTags && ExifTools.isValidType(mediaType)) {
+                            Timber.d("copying exif tags")
+                            ExifTools.copyExif(context.contentResolver.openInputStream(inputFileUri)!!, outputFile)
+                        }
+                        val outputFileCurrentSize = outputFile.length()
+                        Handler(Looper.getMainLooper()).post {
+                            txtProcessedPercent.text = context.getString(R.string.format_percentage, 100.0f)
+                            txtProcessedTime.text = utils.millisToMicrowaveTime(duration)
+                            if (outputFileCurrentSize > 0) {
+                                txtOutputFileSize.text = utils.bytesToHuman(outputFileCurrentSize)
+                            }
+                        }
+
+                        logsDbHelper.addLog(Log(
+                            prettyCommandBoth,
+                            inputFileName,
+                            outputFile.name,
+                            true,
+                            "Pass 1:\n${sessionPass1.output}\n\nPass 2:\n${sessionPass2.output}",
+                            inputFileSize,
+                            outputFileCurrentSize
+                        ))
+                        successHandler(outputFileUri, inputFileSize, outputFileCurrentSize)
+                    }
+                }, { /* logs */ }, { statistics ->
+                    // update TextViews with stats for pass 2
+                    Handler(Looper.getMainLooper()).post {
+                        if (showProgress) {
+                            // Pass 2 progress: 50% + (current_progress / 2)
+                            val pass2Progress = 50.0f + (statistics.time.toFloat() / duration) * 50
+                            txtProcessedPercent.text = context.getString(R.string.format_percentage, pass2Progress)
+                            txtProcessedTime.text = utils.millisToMicrowaveTime(statistics.time.toInt())
+                        }
+                        txtOutputFileSize.text = utils.bytesToHuman(statistics.size)
+                    }
+                })
+            }
+        }, { /* logs */ }, { statistics ->
+            // update TextViews with stats for pass 1
+            Handler(Looper.getMainLooper()).post {
+                if (showProgress) {
+                    // Pass 1 progress: 0% to 50%
+                    val pass1Progress = (statistics.time.toFloat() / duration) * 50
+                    txtProcessedPercent.text = context.getString(R.string.format_percentage, pass1Progress)
+                    txtProcessedTime.text = utils.millisToMicrowaveTime(statistics.time.toInt())
+                }
+            }
+        })
+    }
+
+    private fun getOutputFormat(mediaType: Utils.MediaType): String {
+        return when (mediaType) {
+            Utils.MediaType.MP4 -> "mp4"
+            Utils.MediaType.WEBM -> "webm"
+            Utils.MediaType.MKV -> "matroska"
+            Utils.MediaType.AVI -> "avi"
+            else -> "mp4" // default to mp4
+        }
     }
 
     fun compressFiles(activity: Activity, inputFilesUri: ArrayList<Uri>, callback: (uris: ArrayList<Uri>) -> Unit) {
