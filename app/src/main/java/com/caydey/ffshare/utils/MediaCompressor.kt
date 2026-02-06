@@ -363,7 +363,7 @@ class MediaCompressor(private val context: Context) {
                 }, { /* logs */ }, { statistics ->
                     // update TextViews with stats for pass 2
                     Handler(Looper.getMainLooper()).post {
-                        if (showProgress) {
+                        if (showProgress && duration > 0) {
                             // Pass 2 progress: 50% + (current_progress / 2)
                             val pass2Progress = 50.0f + (statistics.time.toFloat() / duration) * 50
                             txtProcessedPercent.text = context.getString(R.string.format_percentage, pass2Progress)
@@ -376,7 +376,7 @@ class MediaCompressor(private val context: Context) {
         }, { /* logs */ }, { statistics ->
             // update TextViews with stats for pass 1
             Handler(Looper.getMainLooper()).post {
-                if (showProgress) {
+                if (showProgress && duration > 0) {
                     // Pass 1 progress: 0% to 50%
                     val pass1Progress = (statistics.time.toFloat() / duration) * 50
                     txtProcessedPercent.text = context.getString(R.string.format_percentage, pass1Progress)
